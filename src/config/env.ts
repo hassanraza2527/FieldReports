@@ -4,7 +4,7 @@
  * (then "localhost" on the phone == your PC). Alternative: your PC's LAN IP.
  */
 export const config = {
-  baseUrl: 'http://localhost:3000',
+  baseUrl: 'http://192.168.100.13:3000',
   /** Normal JSON calls. */
   requestTimeoutMs: 20_000,
   /** One image PUT. ~1 MB over 2G (~50 kbps) needs ~160 s, so this is generous. */
