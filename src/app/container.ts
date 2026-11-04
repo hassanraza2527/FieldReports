@@ -31,7 +31,7 @@ export function createContainer() {
     kv: store,
     endpoints: config.authEndpoints,
     timeoutMs: config.requestTimeoutMs,
-    onSignedOut: () => useAuthStore.setState({ status: 'signedOut', email: null, name: null }),
+    onSignedOut: reason => useAuthStore.setState({ status: 'signedOut', email: null, name: null, notice: reason ?? null }),
   });
   const api = createApiClient({ http, auth, requestTimeoutMs: config.requestTimeoutMs, uploadTimeoutMs: config.uploadTimeoutMs });
 
@@ -81,6 +81,7 @@ export function createContainer() {
       watchAppActive,
       onOnlineChange: o => {
         online = o;
+        if (o) void auth.syncPending().catch(() => undefined); // a sign-up saved offline is created as soon as we are back online
         useQueueStore.setState({ online: o });
       },
     });
@@ -88,8 +89,10 @@ export function createContainer() {
     useQueueStore.setState({ ready: true });
     const onboarded = (await store.getMeta(K_ONBOARDED)) === '1';
     const token = await auth.getToken();
-    if (token) {
+    const pending = await auth.hasPending();
+    if (token || pending) {
       useAuthStore.setState({ onboarded, status: 'signedIn', email: await auth.getEmail(), name: await auth.getName() });
+      if (pending) void auth.syncPending().catch(() => undefined);
       void engine.kick(); // resume whatever was left in SQLite before the app was closed / killed
     } else {
       useAuthStore.setState({ onboarded, status: 'signedOut', email: null, name: null });
@@ -103,7 +106,7 @@ export function createContainer() {
 
   const signedIn = async () => {
     queryClient.clear();
-    useAuthStore.setState({ status: 'signedIn', email: await auth.getEmail(), name: await auth.getName() });
+    useAuthStore.setState({ status: 'signedIn', email: await auth.getEmail(), name: await auth.getName(), notice: null });
     void engine.kick(); // reports saved earlier now have a token
   };
   const login = async (email: string, password: string) => {

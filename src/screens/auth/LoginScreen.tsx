@@ -4,6 +4,7 @@ import { AppText } from '../../components/atoms/AppText';
 import { Button } from '../../components/atoms/Button';
 import { TextField } from '../../components/atoms/TextField';
 import { Banner } from '../../components/molecules/Banner';
+import { useAuthStore } from '../../state/authStore';
 import { colors } from '../../theme';
 import { AuthLayout, authErrorMessage, EMAIL_RE, singleLine } from './authShared';
 
@@ -14,6 +15,7 @@ export function LoginScreen({ onRegister }: { onRegister: () => void }) {
   const [busy, setBusy] = useState(false);
   const [touched, setTouched] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const notice = useAuthStore(s => s.notice);
 
   const emailErr = !EMAIL_RE.test(email.trim()) ? 'Enter a valid email address.' : null;
   const passErr = password.length === 0 ? 'Enter your password.' : null;
@@ -42,6 +44,7 @@ export function LoginScreen({ onRegister }: { onRegister: () => void }) {
           <Button title="Create an account" variant="secondary" onPress={onRegister} disabled={busy} />
         </>
       }>
+      {notice && !error ? <Banner tone="attention" title="Signed out" detail={notice} /> : null}
       {error ? <Banner tone="attention" title="Could not log in" detail={error} /> : null}
       <TextField label="Email" value={email} onChangeText={setEmail} autoCapitalize="none" autoCorrect={false}
         keyboardType="email-address" textContentType="emailAddress" style={singleLine} error={touched ? emailErr : null} />

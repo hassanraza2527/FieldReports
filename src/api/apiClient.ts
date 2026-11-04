@@ -44,7 +44,13 @@ export function createApiClient(d: ApiClientDeps): UploadApi & ReviewApi {
   /** Adds the bearer token; on 401 refreshes once and replays. Still 401 => ApiError('auth'). */
   async function authed<T = any>(req: Omit<HttpRequest, 'token'>) {
     let token = (await d.auth.getToken()) || null;
-    if (!token) throw new ApiError('auth', 'Not signed in', { status: 401 });
+    // Signed up while offline: create the account first. Still offline => retryable, NOT an auth failure.
+    if (!token && (await d.auth.hasPending())) token = await d.auth.syncPending();
+    if (!token) {
+      throw (await d.auth.hasPending())
+        ? new ApiError('network', 'Account not created on the server yet')
+        : new ApiError('auth', 'Not signed in', { status: 401 });
+    }
     try {
       return await d.http<T>({ ...req, token });
     } catch (e) {
