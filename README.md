@@ -1,97 +1,168 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# Field Reports (React Native, bare CLI, TypeScript)
 
-# Getting Started
+An inspector writes a description, attaches 1–5 photos and saves. The report is **safe on the phone immediately**,
+works offline / on 2G, and is delivered to the server **exactly once**, whatever happens in between
+(force-quit, dropped connection, lost response, server errors).
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+> **Status, honestly.** The pure-TypeScript core (domain, SQLite store, API client, retry policy, upload engine,
+> compression policy, triggers, services) is covered by **55 Jest tests that pass**, including real SQLite
+> (rollback of a half-written report) and every failure scenario below. The whole `src/` type-checks (`tsc --strict`).
+> The native layer (SQLite driver, picker, resizer, NetInfo, file system) and the screens were written against the
+> libraries' documented APIs but **have not been run on a device yet** — see "What I would do with another day".
 
-## Step 1: Start Metro
+---
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+## 1. Run it
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+### Backend (Express + Supabase)
+```bash
+cd FieldReports_backend
+cp .env.example .env     # SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, JWT_SECRET (>=32), ADMIN_KEY (>=8)
+# Supabase dashboard -> SQL Editor -> paste supabase/schema.sql -> Run, then:  notify pgrst, 'reload schema';
+npm install && npm run dev        # http://localhost:3000   (GET /health -> ok)
+```
+Import the Postman collection + environment from the backend folder; run **Auth > Register**, then **Reports (upload flow)**.
 
-```sh
-# Using npm
-npm start
+### App (Android)
+This repo is a complete bare React Native CLI project (RN 0.88.1, TypeScript). Dependencies are already declared.
+Use a **short project path on Windows** (e.g. `C:\rn\FR`): the 260-character limit breaks the Android/CMake build.
+```bash
+npm install
+adb reverse tcp:3000 tcp:3000      # phone's "localhost:3000" == your PC (emulator AND USB phone). URL: src/config/env.ts
+npx react-native start             # terminal 1
+npx react-native run-android       # terminal 2 (device/emulator connected)
+```
+Needs: Node >= 22.11, JDK 17+, Android SDK. Debug builds allow plain `http://`; a release build must use HTTPS.
+Checks (no device needed): `npm test` · `npm run typecheck`
 
-# OR using Yarn
-yarn start
+---
+
+## 2. How to make the backend fail (on demand)
+
+Header `x-admin-key: <ADMIN_KEY>` on all admin routes. All are pre-built in the Postman folder **"Admin & failure injection"**.
+
+| Want to see…                         | Call (`POST /api/admin/chaos`)               | What the app should do |
+|--------------------------------------|----------------------------------------------|------------------------|
+| Slow network                         | `{"latencyMs": 5000}`                        | Strip shows *Uploading…*, still completes |
+| Dropped connections                  | `{"dropRate": 0.3}`                          | Retries with backoff, no duplicates |
+| **Lost response** (server did apply it) | `{"loseResponseRate": 0.5}`               | Next attempt asks the server what it has → nothing re-sent, nothing duplicated |
+| Server hangs                         | `{"hangRate": 1}`                            | Request timeout (20 s / 180 s for photos) → retry |
+| Transient server error               | `{"errorRate": 1, "errorStatus": 503}`       | Retry with exponential backoff + jitter |
+| **Permanent** rejection              | `{"errorRate": 1, "errorStatus": 422}`       | Report becomes *Needs attention* (kept!), Retry / Discard buttons |
+| Refuse photos                        | `{"rejectUploads": true}`                    | See what the server returns; 5xx retries, 4xx = needs attention |
+| Back to normal                       | `{"reset": true}`                            | Queue drains by itself |
+| Count what the server really holds   | `GET /api/admin/stats`                       | `reports.committed` / `imagesUploaded` must equal what you sent — **no duplicates** |
+| Wipe server data                     | `POST /api/admin/reset`                      | Engine gets 404 → re-creates the report and finishes |
+
+Offline tests need no backend tricks: airplane mode → save a report → force-quit → reconnect.
+
+---
+
+## 3. Architecture
+
+```
+UI (atoms → molecules → organisms → templates → screens)
+        │ reads                              │ commands
+   Zustand (mirror of queue)           services/reportService  (submit / retry / discard / reset)
+   TanStack Query (server list ONLY)            │
+                                               ▼
+                         ┌────────────── upload/engine (pure TS) ──────────────┐
+                         │ compress → PUT report → ask server → PUT images → commit │
+                         └──┬───────────────┬───────────────────┬───────────────┘
+                     ReportStore (port)  UploadApi (port)   ImageCompressor / FileOps
+                            │                  │                   │
+                   SQLite (op-sqlite)    api/ (fetch, auth)   images/ + platform/ (native)
 ```
 
-## Step 2: Build and run your app
-
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
-
-### Android
-
-```sh
-# Using npm
-npm run android
-
-# OR using Yarn
-yarn android
+```
+src/
+  config/      env.ts (base URL, timeouts, retry numbers)
+  domain/      types, validation, syncSummary (status-strip wording), reportList (merge)   ← pure
+  storage/     ReportStore (port) · sqlite/ (driver adapter, migrations, store) · memory/ (test twin)
+  api/         http (all failures → ApiError), authService (silent device account), apiClient
+  upload/      engine (the queue) · retryPolicy (classify + backoff) · triggers (network/foreground)
+  images/      compression (ladder policy, pure) · imageProcessor (native resize) · imageImport (picker → durable copy)
+  platform/    files · network · permissions · ids      ← only place touching native modules (+ images/, sqlite adapter)
+  services/    reportService (use-cases)
+  state/       queueStore (mirror) · draftStore (unsent form)
+  queries/     TanStack Query client + useServerReports
+  app/         container.ts (composition root: the ONLY place concrete classes are wired)
+  components/  atoms · molecules · organisms · templates      screens/ · navigation/ · theme/
+  __tests__/   55 tests          testing/ fake server + harness
 ```
 
-### iOS
+**Dependency rule:** `domain`, `upload`, `storage` ports, `api` import no React and no native module, so the entire
+delivery logic runs in Jest with a fake server and a fake clock.
 
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
+---
 
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
+## 4. Delivery guarantees – how each one is achieved
 
-```sh
-bundle install
-```
+**Nothing lost**
+- *Save* = **one SQLite transaction** (report row + every image row). Tested: if an image row fails, the report is not half-saved. Only after it commits does the UI say **"Saved on phone"**.
+- Photos are copied from the picker's temporary URI into the app's private storage **at pick time**, and compressed from that copy. Nothing relies on a cache URI the OS may clear.
+- The queue lives in SQLite, so force-quit / reboot / crash loses nothing; on launch the engine resumes (`engine.kick()` in `bootstrap`).
+- A report is **never deleted by the app because of an error.** Permanent failures become *Needs attention* with Retry and (confirmed) Discard.
+- Local files are deleted only **after** the server confirmed the commit.
 
-Then, and every time you update your native dependencies, run:
+**Nothing twice**
+- The client generates UUIDs for the report and each image; every server call is an idempotent upsert; repeating any step is harmless (verified against the Postman "re-send / commit again" requests).
+- **Lost response:** before continuing a report that was ever started, the engine calls `GET /reports/:id` and trusts the server's `receivedImageIds` → images the server already has are not re-sent.
+- One report at a time, one engine run at a time (re-entrant `kick()` just sets a re-run flag).
 
-```sh
-bundle exec pod install
-```
+**Retry policy** (`upload/retryPolicy.ts`, table-tested)
 
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
+| Outcome | Action |
+|---|---|
+| network error, timeout, 5xx, 408, 429 (honours `Retry-After`) | retry, exponential backoff, full jitter, 0.5 s → 5 min cap, never gives up |
+| 400, 413, 422, other 4xx | permanent → *Needs attention* |
+| 401 | re-login silently once; if still refused → **pause queue**, report untouched, never failed |
+| 404 (server forgot the report) / 409 (server lacks an image) | resync state and retry immediately (then backoff) |
+| unexpected local error | a few retries, then *Needs attention* |
 
-```sh
-# Using npm
-npm run ios
+**Triggers:** app start · report saved · network back · app foregrounded · backoff timer.
+"Online" = **our `/health` answers** (NetInfo's reachability probe points at the backend), not merely "Wi-Fi is on".
 
-# OR using Yarn
-yarn ios
-```
+---
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+## 5. Images
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+- Pick → durable copy → (background) native resize to ≤1920 px, JPEG q80 → typically **0.4–1 MB** from an 18 MB original.
+- If still above the 1 MB target, a ladder steps down (1600/70 → 1280/60 → 1024/50 → 800/40), **always re-encoding from the original**, never a compressed copy. Anything ≥ 4.5 MB is refused before upload (limit is 5 MB); unit-tested.
+- Runs in the native thread pool, one image at a time: the JS thread and UI never freeze, memory stays flat.
+- The native encoder bakes EXIF orientation into the pixels (photos upright everywhere) and writes no metadata (**GPS is not uploaded**).
 
-## Step 3: Modify your app
+## 6. UX notes
+- Always-visible **status strip**: *All reports uploaded* · *Uploading 2 reports (photos 3/5)* · *Waiting for connection (1 saved on phone)* · *Will retry shortly* · *N need attention* / *Upload paused*.
+  Wording rule (unit-tested): **"saved on phone" and "uploaded" never appear together** – "uploaded" only when nothing is waiting.
+- Review list is **fetched from the server**; unsent reports appear on top with their own badge; server wins on duplicates; a local row is pruned only after the server list shows it.
+- Save button is disabled until the report is valid (non-blank text, 1–5 photos) and says why; 48 dp touch targets; permission denied/blocked has an explanation and an "Open settings" path.
 
-Now that you have successfully run the app, let's make changes!
+## 7. Reset – exact scope
+**Deletes:** this phone's queue (reports + image rows), all locally stored photo files, the unsent draft.
+**Does not touch:** anything on the server, and the device's sign-in (otherwise Review would lose access to its own reports).
+The confirmation dialog states how many unsent reports will be lost. In-flight uploads are cancelled first (abort signal), then data is cleared.
 
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
+---
 
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
+## 8. Decisions
+- **SQLite is the queue and the source of truth**; Zustand is only a mirror; TanStack Query holds *server* data only. The engine is plain TypeScript, **not** `useMutation` – mutations die with the component tree, a queue must not.
+- **Ports & adapters** (`ReportStore`, `UploadApi`): the same engine runs against SQLite in the app and an in-memory twin in tests; the SQL itself is tested against real SQLite.
+- **Silent device account** because the brief says "no login": the app registers `device-<uuid>@fieldreports.dev` on first launch, keeps the credentials locally and re-logs-in on 401. (The backend's JWT is an extra the brief didn't ask for.)
+- **Per-image PUT + commit** matches the backend contract and makes progress resumable at image granularity.
+- Compress **after** saving, not before: saving is instant on any phone, compression can't block or lose the report.
 
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
+## 9. What I would do with another day
+1. **Run on a real device/emulator** and fix whatever the native layer surfaces (driver API shapes, resizer output, picker edge cases). This is the biggest open item.
+2. **Resumable/chunked image upload** – a single PUT of ~1 MB on 2G can take minutes and restarts from zero on a dropped connection (needs a backend change).
+3. **Background delivery with the app closed** (WorkManager / headless task). Today uploads continue while the app is open or resumes on next launch.
+4. Persist the in-progress draft (text + photos) across a force-quit; clean up orphaned photo files on startup.
+5. Detox/Maestro end-to-end test; component tests for the screens.
+6. Tokens in the Android Keystore (`react-native-keychain`) instead of the SQLite meta table.
 
-## Congratulations! :tada:
+## 10. What I left out (deliberately)
+No login UI (brief), no editing/deleting reports after saving, no pagination (list asks for the latest 50), no iOS verification,
+no dark theme, no in-app failure-injection panel (use Postman/curl), no push notifications.
 
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+**Backend known gaps:** no rate limiting, no refresh-token revocation, login timing leak for unknown emails, no automated tests,
+Postgres + Storage writes are not atomic (commit verifies images exist, which covers the practical failure), chaos state is in memory.
