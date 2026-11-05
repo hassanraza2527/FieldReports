@@ -11,7 +11,6 @@ import { ScreenTemplate } from '../components/templates/ScreenTemplate';
 import { mergeReports } from '../domain/reportList';
 import { TabParamList } from '../navigation/types';
 import { useServerReports } from '../queries/useServerReports';
-import { useAuthStore } from '../state/authStore';
 import { useQueueStore } from '../state/queueStore';
 import { colors, spacing } from '../theme';
 import { useSyncSummary } from './useSyncSummary';
@@ -20,7 +19,6 @@ const RECENT = 3;
 
 export function HomeScreen() {
   const navigation = useNavigation<BottomTabNavigationProp<TabParamList>>();
-  const name = useAuthStore(s => s.name);
   const local = useQueueStore(s => s.reports);
   const { data, isFetching, refetch } = useServerReports();
   const summary = useSyncSummary();
@@ -29,13 +27,12 @@ export function HomeScreen() {
 
   const uploaded = data?.length ?? 0;
   const waiting = local.filter(r => r.state !== 'synced').length;
-  const first = name?.trim().split(/\s+/)[0];
 
   return (
     <ScreenTemplate title="Home" summary={summary}>
       <ScrollView contentContainerStyle={styles.c} refreshControl={<RefreshControl refreshing={isFetching} onRefresh={() => void refetch()} />}>
         <Card style={styles.hero}>
-          <AppText variant="title">{first ? `Hello, ${first}` : 'Hello'}</AppText>
+          <AppText variant="title">Field reports</AppText>
           <AppText color={colors.muted}>Write a description, add up to 5 photos and save. It uploads by itself, even from a weak connection.</AppText>
           <Button title="New report" onPress={() => navigation.navigate('Compose')} />
         </Card>

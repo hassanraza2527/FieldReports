@@ -11,8 +11,6 @@ export interface UploadApi {
 }
 export interface ReviewApi {
   listReports(limit?: number): Promise<ServerReport[]>;
-  /** Deletes one of the signed-in user's reports on the server. Already gone (404) counts as success. */
-  deleteReport(id: string): Promise<void>;
 }
 
 export interface ApiClientDeps {
@@ -43,8 +41,9 @@ export function createApiClient(d: ApiClientDeps): UploadApi & ReviewApi {
 
   /** Adds the bearer token; on 401 refreshes once and replays. Still 401 => ApiError('auth'). */
   async function authed<T = any>(req: Omit<HttpRequest, 'token'>) {
-    let token = (await d.auth.getToken()) || null;
-    // Signed up while offline: create the account first. Still offline => retryable, NOT an auth failure.
+    await d.auth.ensureAccount(); // silent device account (no-op once it exists)
+    let token = await d.auth.getToken();
+    // Account saved while offline: create it first. Still offline => retryable, NOT an auth failure.
     if (!token && (await d.auth.hasPending())) token = await d.auth.syncPending();
     if (!token) {
       throw (await d.auth.hasPending())
@@ -96,14 +95,6 @@ export function createApiClient(d: ApiClientDeps): UploadApi & ReviewApi {
     async listReports(limit = 50) {
       const r = await authed({ method: 'GET', path: `/api/reports?limit=${limit}`, timeoutMs: d.requestTimeoutMs });
       return (r.data.reports ?? []).map(mapServerReport);
-    },
-    async deleteReport(id) {
-      try {
-        await authed({ method: 'DELETE', path: `/api/reports/${id}`, timeoutMs: d.requestTimeoutMs });
-      } catch (e) {
-        if (isApiError(e) && e.kind === 'http' && e.status === 404) return;
-        throw e;
-      }
     },
   };
 }

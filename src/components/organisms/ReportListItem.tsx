@@ -13,7 +13,6 @@ interface Props {
   item: ListItem;
   onRetry: (id: string) => void;
   onDiscard: (id: string) => void;
-  onDeleteServer: (id: string) => void;
 }
 
 export function describe(item: ListItem): { label: string; tone: Tone; note?: string } {
@@ -29,7 +28,7 @@ export function describe(item: ListItem): { label: string; tone: Tone; note?: st
   };
 }
 
-export const ReportListItem = ({ item, onRetry, onDiscard, onDeleteServer }: Props) => {
+export const ReportListItem = ({ item, onRetry, onDiscard }: Props) => {
   const d = describe(item);
   const [open, setOpen] = useState(false);
   const thumbs =
@@ -50,9 +49,6 @@ export const ReportListItem = ({ item, onRetry, onDiscard, onDeleteServer }: Pro
       <View style={styles.thumbs}>
         {thumbs.filter(t => t.uri).map(t => <PhotoTile key={t.id} uri={t.uri as string} size={open ? 150 : 56} />)}
       </View>
-      {item.source === 'server' && open ? (
-        <Button title="Delete report" variant="danger" onPress={() => onDeleteServer(item.id)} />
-      ) : null}
       {item.source === 'local' && item.report.state === 'failed' ? (
         <View style={styles.actions}>
           <View style={styles.flex}><Button title="Retry" onPress={() => onRetry(item.id)} /></View>

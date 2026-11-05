@@ -111,7 +111,7 @@ describe('validation + merge', () => {
   });
 });
 
-describe('auth + api client', () => {
+describe('silent device account + api client', () => {
   const mk = (handler: (req: any) => any) => {
     const calls: any[] = [];
     const h: Http = async (req: any) => {
@@ -119,62 +119,56 @@ describe('auth + api client', () => {
       return handler(req);
     };
     const kv = new InMemoryReportStore();
-    let signedOut = 0;
+    let n = 0;
     const auth = new AuthService({
       http: h,
       kv,
       endpoints: { login: '/api/auth/login', register: '/api/auth/register', refresh: '/api/auth/refresh' },
       timeoutMs: 1,
-      onSignedOut: () => void signedOut++,
+      newId: () => `id${++n}`,
     });
     const api = createApiClient({ http: h, auth, requestTimeoutMs: 1, uploadTimeoutMs: 1, readFile: async () => 'blob' });
-    return { calls, kv, auth, api, signedOutCount: () => signedOut };
+    return { calls, kv, auth, api };
   };
-  it('register posts name/email/password and stores token + email', async () => {
-    const { auth, kv, calls } = mk(async () => ({ status: 201, data: { token: 'T1' } }));
-    expect(await auth.register('Ali', 'a@b.co', 'secret123')).toBe('T1');
-    expect(calls[0]).toMatchObject({ path: '/api/auth/register', json: { name: 'Ali', email: 'a@b.co', password: 'secret123' } });
+  it('first request silently registers a device account, stores the token and reuses it', async () => {
+    const { api, kv, calls } = mk(async (req: any) => (req.path === '/api/auth/register' ? { status: 201, data: { token: 'T1' } } : { status: 200, data: { reports: [] } }));
+    await api.listReports();
+    await api.listReports();
+    expect(calls.map(c => c.path)).toEqual(['/api/auth/register', '/api/reports?limit=50', '/api/reports?limit=50']);
+    expect(calls[0].json.email).toMatch(/^device-.*@fieldreports\.dev$/);
+    expect(calls[1].token).toBe('T1');
     expect(await kv.getMeta('auth.token')).toBe('T1');
-    expect(await auth.getEmail()).toBe('a@b.co');
-    expect(await auth.getName()).toBe('Ali');
   });
-  it('login posts email/password; a wrong password surfaces the 401 and stores nothing', async () => {
-    const ok = mk(async () => ({ status: 200, data: { token: 'T2' } }));
-    expect(await ok.auth.login('a@b.co', 'pw')).toBe('T2');
-    expect(ok.calls[0]).toMatchObject({ path: '/api/auth/login', json: { email: 'a@b.co', password: 'pw' } });
-    const bad = mk(async () => {
-      throw new ApiError('http', 'Invalid credentials', { status: 401 });
+  it('offline at first launch: sign-up is saved, requests are retryable (network), account is created when back online', async () => {
+    let online = false;
+    const { api, auth, kv, calls } = mk(async (req: any) => {
+      if (!online) throw new ApiError('network', 'down');
+      return req.path === '/api/auth/register' ? { status: 201, data: { token: 'T1' } } : { status: 200, data: { reports: [] } };
     });
-    await expect(bad.auth.login('a@b.co', 'x')).rejects.toMatchObject({ status: 401 });
-    expect(await bad.auth.getToken()).toBeNull();
+    await auth.ensureAccount();
+    expect(await auth.hasPending()).toBe(true);
+    await expect(api.listReports()).rejects.toMatchObject({ kind: 'network' }); // NOT 'auth': the queue keeps retrying
+    online = true;
+    await api.listReports();
+    expect(await auth.hasPending()).toBe(false);
+    expect(await kv.getMeta('auth.token')).toBe('T1');
+    expect(calls.filter(c => c.path === '/api/auth/register')).toHaveLength(3); // ensure (offline) + 2 sync tries, same credentials
+    expect(new Set(calls.filter(c => c.path === '/api/auth/register').map(c => c.json.email)).size).toBe(1);
   });
-  it('logout clears the token', async () => {
-    const { auth } = mk(async () => ({ status: 200, data: { token: 'T' } }));
-    await auth.login('a@b.co', 'pw');
-    await auth.logout();
-    expect(await auth.getToken()).toBeFalsy();
-    expect(await auth.getName()).toBeNull();
-  });
-  it('without a token a request is an auth error (no silent account)', async () => {
-    const { api, calls } = mk(async () => ({ status: 200, data: { reports: [] } }));
-    await expect(api.listReports()).rejects.toMatchObject({ kind: 'auth' });
-    expect(calls).toHaveLength(0);
-  });
-  it('deleteReport sends DELETE; a 404 (already gone) is success, other errors propagate', async () => {
-    const ok = mk(async () => ({ status: 204, data: null }));
-    await ok.kv.setMeta('auth.token', 'T');
-    await ok.api.deleteReport('r1');
-    expect(ok.calls[0]).toMatchObject({ method: 'DELETE', path: '/api/reports/r1' });
-    const gone = mk(async () => {
-      throw new ApiError('http', 'nf', { status: 404 });
+  it('a lost sign-up response (409 on retry) is recovered by logging in with the same password', async () => {
+    let first = true;
+    const { auth, kv, calls } = mk(async (req: any) => {
+      if (req.path === '/api/auth/register' && first) {
+        first = false;
+        throw new ApiError('timeout', 'lost');
+      }
+      if (req.path === '/api/auth/register') throw new ApiError('http', 'exists', { status: 409 });
+      return { status: 200, data: { token: 'T9' } };
     });
-    await gone.kv.setMeta('auth.token', 'T');
-    await expect(gone.api.deleteReport('r1')).resolves.toBeUndefined();
-    const down = mk(async () => {
-      throw new ApiError('network', 'down');
-    });
-    await down.kv.setMeta('auth.token', 'T');
-    await expect(down.api.deleteReport('r1')).rejects.toMatchObject({ kind: 'network' });
+    await auth.ensureAccount();
+    expect(await auth.syncPending()).toBe('T9');
+    expect(calls.map(c => c.path)).toEqual(['/api/auth/register', '/api/auth/register', '/api/auth/login']);
+    expect(await kv.getMeta('auth.token')).toBe('T9');
   });
   it('a 401 triggers one refresh and a replay', async () => {
     let first = true;
@@ -190,13 +184,34 @@ describe('auth + api client', () => {
     await api.listReports();
     expect(calls.map(c => c.path)).toEqual(['/api/reports?limit=50', '/api/auth/refresh', '/api/reports?limit=50']);
   });
-  it('credentials refused for good => ApiError(auth), never a plain failure', async () => {
-    const { api, kv, signedOutCount } = mk(async () => {
-      throw new ApiError('http', 'no', { status: 401 });
+  it('refresh refused => silent re-login with the phone\'s own credentials, no UI involved', async () => {
+    const { api, auth, kv, calls } = mk(async (req: any) => {
+      if (req.path === '/api/auth/register') return { status: 201, data: { token: 'OLD' } };
+      if (req.path === '/api/auth/refresh') throw new ApiError('http', 'no', { status: 401 });
+      if (req.path === '/api/auth/login') return { status: 200, data: { token: 'FRESH' } };
+      if (req.token === 'OLD') throw new ApiError('http', 'expired', { status: 401 });
+      return { status: 200, data: { reports: [] } };
     });
-    await kv.setMeta('auth.token', 'OLD');
+    await auth.ensureAccount();
+    await api.listReports();
+    expect(calls.map(c => c.path)).toEqual(['/api/auth/register', '/api/reports?limit=50', '/api/auth/refresh', '/api/auth/login', '/api/reports?limit=50']);
+    expect(await kv.getMeta('auth.token')).toBe('FRESH');
+  });
+  it('server wiped (login 401) => the device account is registered again with the same credentials', async () => {
+    const { api, auth, kv, calls } = mk(async (req: any) => {
+      if (req.path === '/api/auth/register') return { status: 201, data: { token: calls.length > 3 ? 'AGAIN' : 'OLD' } };
+      if (req.path === '/api/auth/refresh' || req.path === '/api/auth/login') throw new ApiError('http', 'no', { status: 401 });
+      if (req.token === 'OLD') throw new ApiError('http', 'expired', { status: 401 });
+      return { status: 200, data: { reports: [] } };
+    });
+    await auth.ensureAccount();
+    await api.listReports();
+    expect(await kv.getMeta('auth.token')).toBe('AGAIN');
+  });
+  it('account refused for good (e.g. 409) => ApiError(auth): queue pauses, report untouched, never a plain failure', async () => {
+    const { api } = mk(async () => {
+      throw new ApiError('http', 'exists', { status: 409 });
+    });
     await expect(api.listReports()).rejects.toMatchObject({ kind: 'auth' });
-    expect(signedOutCount()).toBe(1); // UI is told to show the login screen
-    expect(await kv.getMeta('auth.token')).toBeFalsy();
   });
 });

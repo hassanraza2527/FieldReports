@@ -34,8 +34,14 @@ export const files = {
   async sizeOf(p: string) {
     return Number((await RNFS.stat(stripScheme(p))).size);
   },
+  /** Delete a picker temp file, but only if it lives in the app's own cache (never a file in the user's gallery). */
+  async removePickerTemp(uri: string) {
+    const path = stripScheme(decodeURI(uri));
+    if (path.startsWith(RNFS.CachesDirectoryPath)) await files.remove(path);
+  },
   async clearAll() {
-    for (const d of [dirs.pending, dirs.ready]) {
+    // The picker leaves full-size originals (an 18 MB camera shot each) in its cache: Reset must not leave them behind.
+    for (const d of [dirs.pending, dirs.ready, `${RNFS.CachesDirectoryPath}/rn_image_picker_lib_temp`]) {
       if (await RNFS.exists(d)) await RNFS.unlink(d);
     }
     await files.ensureDirs();

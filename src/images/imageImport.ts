@@ -24,6 +24,7 @@ export async function pickPhotos(source: 'camera' | 'library', remaining: number
     const id = newId();
     // Copy NOW: picker URIs live in a cache the OS may clear before the user submits or the network returns.
     out.push({ id, path: await files.copyIn(a.uri, id) });
+    await files.removePickerTemp(a.uri).catch(() => undefined); // our copy is the only one we keep
   }
   return out;
 }

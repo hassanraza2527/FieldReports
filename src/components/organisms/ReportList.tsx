@@ -12,13 +12,12 @@ interface Props {
   header?: React.ReactElement | null;
   onRetry: (id: string) => void;
   onDiscard: (id: string) => void;
-  onDeleteServer: (id: string) => void;
 }
-export const ReportList = ({ items, refreshing, onRefresh, header, onRetry, onDiscard, onDeleteServer }: Props) => (
+export const ReportList = ({ items, refreshing, onRefresh, header, onRetry, onDiscard }: Props) => (
   <FlatList
     data={items}
     keyExtractor={i => `${i.source}:${i.id}`}
-    renderItem={({ item }) => <ReportListItem item={item} onRetry={onRetry} onDiscard={onDiscard} onDeleteServer={onDeleteServer} />}
+    renderItem={({ item }) => <ReportListItem item={item} onRetry={onRetry} onDiscard={onDiscard} />}
     contentContainerStyle={styles.c}
     ListHeaderComponent={header ?? undefined}
     ListEmptyComponent={<EmptyState title="No reports yet" detail="Reports you save appear here once the server has them." />}

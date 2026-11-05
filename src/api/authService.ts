@@ -3,11 +3,10 @@ import { ApiError, isApiError } from './errors';
 import { Http } from './http';
 
 const K_TOKEN = 'auth.token';
-const K_EMAIL = 'auth.email';
-const K_NAME = 'auth.name';
-const K_PENDING = 'auth.pending'; // sign-up saved on the phone, not yet created on the server
+const K_DEVICE = 'auth.device'; // this phone's own credentials, kept so a lost session can be re-opened silently
+const K_PENDING = 'auth.pending'; // account saved on the phone, not yet created on the server (created offline)
 
-interface PendingSignup {
+interface Credentials {
   name: string;
   email: string;
   password: string;
@@ -23,57 +22,52 @@ export interface AuthDeps {
   kv: KeyValueStore;
   endpoints: AuthEndpoints;
   timeoutMs: number;
-  /** Called when the session is gone for good (refresh refused) so the UI can show the login screen. */
-  onSignedOut?: (reason?: string) => void;
+  /** Random id source (uuid) used to make the device's credentials. */
+  newId: () => string;
 }
 
+type TokenResponse = { data: { token?: string } };
 const is401 = (e: unknown) => isApiError(e) && e.kind === 'http' && e.status === 401;
 /** No network, timeout, or a server that is down / busy: worth trying again later. */
 const isTransient = (e: unknown) =>
   isApiError(e) && (e.kind === 'network' || e.kind === 'timeout' || (e.kind === 'http' && !!e.status && (e.status >= 500 || e.status === 408 || e.status === 429)));
 
-/** Real user accounts: register / login / logout, plus a silent token refresh when a request gets a 401. */
+/**
+ * Silent DEVICE account. The brief has no login, but the backend wants a token, so the app creates its own account
+ * the first time it needs one (even offline: the sign-up is saved and created later) and never shows a screen for it.
+ * Token lost / expired -> refresh, and if that is refused, log in again with the phone's own credentials.
+ */
 export class AuthService {
   private inflight: Promise<string> | null = null;
   private syncing: Promise<string | null> | null = null;
   constructor(private d: AuthDeps) {}
 
   getToken(): Promise<string | null> {
-    return this.d.kv.getMeta(K_TOKEN);
-  }
-  getEmail(): Promise<string | null> {
-    return this.d.kv.getMeta(K_EMAIL);
-  }
-  async getName(): Promise<string | null> {
-    return (await this.d.kv.getMeta(K_NAME)) || null;
-  }
-
-  async login(email: string, password: string): Promise<string> {
-    return this.finish(email, null, await this.d.http<{ token: string; user?: { name?: string } }>({
-      method: 'POST', path: this.d.endpoints.login, json: { email, password }, timeoutMs: this.d.timeoutMs,
-    }));
-  }
-
-  /**
-   * Returns the token, or null when the server could not be reached and the sign-up was saved on the phone instead.
-   * A saved sign-up is created on the server later by syncPending().
-   */
-  async register(name: string, email: string, password: string): Promise<string | null> {
-    try {
-      return await this.finish(email, name, await this.d.http<{ token: string; user?: { name?: string } }>({
-        method: 'POST', path: this.d.endpoints.register, json: { name, email, password }, timeoutMs: this.d.timeoutMs,
-      }));
-    } catch (e) {
-      if (!isTransient(e)) throw e; // e.g. 409 email taken, 400 validation: tell the user now
-      await this.d.kv.setMeta(K_PENDING, JSON.stringify({ name, email, password } satisfies PendingSignup));
-      await this.d.kv.setMeta(K_EMAIL, email);
-      await this.d.kv.setMeta(K_NAME, name);
-      return null;
-    }
+    return this.d.kv.getMeta(K_TOKEN).then(t => t || null);
   }
 
   async hasPending(): Promise<boolean> {
     return !!(await this.d.kv.getMeta(K_PENDING));
+  }
+
+  /**
+   * Makes sure this phone has (or is about to have) an account. No-op if it already has a token or a saved sign-up.
+   * Offline is fine: the sign-up is saved and syncPending() creates it later.
+   * Throws ApiError('auth') only if the server refuses to create the account for good.
+   */
+  async ensureAccount(): Promise<void> {
+    if ((await this.getToken()) || (await this.hasPending())) return;
+    const c: Credentials = { name: 'Field inspector', email: `device-${this.d.newId()}@fieldreports.dev`, password: `${this.d.newId()}${this.d.newId()}` };
+    await this.d.kv.setMeta(K_DEVICE, JSON.stringify(c));
+    try {
+      await this.finish(await this.post(this.d.endpoints.register, c));
+    } catch (e) {
+      if (!isTransient(e)) {
+        await this.forget();
+        throw new ApiError('auth', 'Account was refused by the server', { status: 401 });
+      }
+      await this.d.kv.setMeta(K_PENDING, JSON.stringify(c)); // offline: created later
+    }
   }
 
   /** Creates the saved sign-up on the server. Token on success, null while still offline, throws ApiError('auth') if refused for good. */
@@ -88,37 +82,25 @@ export class AuthService {
 
   private async doSyncPending(): Promise<string | null> {
     const raw = await this.d.kv.getMeta(K_PENDING);
-    if (!raw) return (await this.getToken()) || null;
-    const p = JSON.parse(raw) as PendingSignup;
-    const post = (path: string, json: object) =>
-      this.d.http<{ token: string; user?: { name?: string } }>({ method: 'POST', path, json, timeoutMs: this.d.timeoutMs });
+    if (!raw) return this.getToken();
+    const c = JSON.parse(raw) as Credentials;
     try {
-      let res;
+      let res: TokenResponse;
       try {
-        res = await post(this.d.endpoints.register, p);
+        res = await this.post(this.d.endpoints.register, c);
       } catch (e) {
         if (!(isApiError(e) && e.kind === 'http' && e.status === 409)) throw e;
-        // 409: either an earlier attempt DID create it (its answer was lost) or the email belongs to someone else.
-        // Logging in with the same password tells the two apart.
-        res = await post(this.d.endpoints.login, { email: p.email, password: p.password });
+        // 409: an earlier attempt DID create it and its answer was lost. Same password => it is ours.
+        res = await this.post(this.d.endpoints.login, { email: c.email, password: c.password });
       }
-      const token = await this.finish(p.email, p.name, res);
+      const token = await this.finish(res);
       await this.d.kv.setMeta(K_PENDING, '');
       return token;
     } catch (e) {
       if (isTransient(e)) return null;
-      const why = isApiError(e) && e.status === 401 ? 'This email is already used by another account.' : isApiError(e) ? e.message : 'Unknown error';
-      await this.logout();
-      this.d.onSignedOut?.(`Your account could not be created: ${why} Please sign up again with another email.`);
-      throw new ApiError('auth', 'Sign-up refused', { status: 401 });
+      await this.forget(); // refused for good: the next request makes a brand-new device account
+      throw new ApiError('auth', 'Account was refused by the server', { status: 401 });
     }
-  }
-
-  async logout(): Promise<void> {
-    await this.d.kv.setMeta(K_TOKEN, '');
-    await this.d.kv.setMeta(K_EMAIL, '');
-    await this.d.kv.setMeta(K_NAME, '');
-    await this.d.kv.setMeta(K_PENDING, '');
   }
 
   /** Called after a 401. Single-flight so parallel requests do not stampede the server. */
@@ -131,30 +113,51 @@ export class AuthService {
     return this.inflight;
   }
 
-  private async finish(email: string, name: string | null, res: { data: { token?: string; user?: { name?: string } } }): Promise<string> {
+  private async doRefresh(staleToken: string | null): Promise<string> {
+    const current = await this.getToken();
+    if (current && current !== staleToken) return current; // someone else already refreshed
+    if (current) {
+      try {
+        const r = await this.d.http<{ token: string }>({ method: 'POST', path: this.d.endpoints.refresh, token: current, timeoutMs: this.d.timeoutMs });
+        await this.d.kv.setMeta(K_TOKEN, r.data.token);
+        return r.data.token;
+      } catch (e) {
+        if (!is401(e)) throw e; // network / 5xx: keep the session, retry later
+      }
+    }
+    return this.reauthenticate();
+  }
+
+  /** Refresh refused (or no token): open a new session with this phone's own credentials. Never shows UI. */
+  private async reauthenticate(): Promise<string> {
+    const raw = await this.d.kv.getMeta(K_DEVICE);
+    if (!raw) throw new ApiError('auth', 'No device account', { status: 401 });
+    const c = JSON.parse(raw) as Credentials;
+    try {
+      return await this.finish(await this.post(this.d.endpoints.login, { email: c.email, password: c.password }));
+    } catch (e) {
+      if (!is401(e)) throw e;
+    }
+    try {
+      return await this.finish(await this.post(this.d.endpoints.register, c)); // server forgot us (e.g. it was wiped)
+    } catch (e) {
+      if (isTransient(e)) throw e;
+      throw new ApiError('auth', 'Account was refused by the server', { status: 401 });
+    }
+  }
+
+  private post(path: string, json: object): Promise<TokenResponse> {
+    return this.d.http<{ token?: string }>({ method: 'POST', path, json, timeoutMs: this.d.timeoutMs });
+  }
+
+  private async finish(res: TokenResponse): Promise<string> {
     const token = res.data?.token;
     if (!token) throw new ApiError('http', 'Server did not return a token', { status: 500 });
     await this.d.kv.setMeta(K_TOKEN, token);
-    await this.d.kv.setMeta(K_EMAIL, email);
-    await this.d.kv.setMeta(K_NAME, res.data.user?.name ?? name ?? '');
     return token;
   }
 
-  private async doRefresh(staleToken: string | null): Promise<string> {
-    const current = await this.d.kv.getMeta(K_TOKEN);
-    if (current && current !== staleToken) return current; // someone else already refreshed
-    if (!current) throw new ApiError('auth', 'Not signed in', { status: 401 });
-    try {
-      const r = await this.d.http<{ token: string }>({
-        method: 'POST', path: this.d.endpoints.refresh, token: current, timeoutMs: this.d.timeoutMs,
-      });
-      await this.d.kv.setMeta(K_TOKEN, r.data.token);
-      return r.data.token;
-    } catch (e) {
-      if (!is401(e)) throw e; // network / 5xx: keep the session, retry later
-      await this.logout();
-      this.d.onSignedOut?.();
-      throw new ApiError('auth', 'Session expired, please log in again', { status: 401 });
-    }
+  private async forget() {
+    for (const k of [K_TOKEN, K_DEVICE, K_PENDING]) await this.d.kv.setMeta(k, '');
   }
 }

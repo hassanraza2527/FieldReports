@@ -3,14 +3,12 @@ import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import React, { useCallback, useEffect, useMemo } from 'react';
 import { Alert, Pressable } from 'react-native';
 import { AppText } from '../components/atoms/AppText';
-import { useQueryClient } from '@tanstack/react-query';
 import { getContainer } from '../app/container';
 import { Banner } from '../components/molecules/Banner';
 import { ReportList } from '../components/organisms/ReportList';
 import { ScreenTemplate } from '../components/templates/ScreenTemplate';
 import { mergeReports } from '../domain/reportList';
 import { TabParamList } from '../navigation/types';
-import { SERVER_REPORTS_KEY } from '../queries/queryClient';
 import { useServerReports } from '../queries/useServerReports';
 import { useQueueStore } from '../state/queueStore';
 import { colors } from '../theme';
@@ -21,7 +19,6 @@ export function ReportsScreen() {
   const local = useQueueStore(s => s.reports);
   const summary = useSyncSummary();
   const navigation = useNavigation<BottomTabNavigationProp<TabParamList>>();
-  const qc = useQueryClient();
   const items = useMemo(() => mergeReports(local, data ?? []), [local, data]);
 
   useFocusEffect(useCallback(() => void refetch(), [refetch]));
@@ -38,25 +35,6 @@ export function ReportsScreen() {
     ]);
   }, []);
 
-  const deleteServer = useCallback((id: string) => {
-    Alert.alert('Delete this report?', 'The report and its photos will be permanently deleted from the server. This cannot be undone.', [
-      { text: 'Keep', style: 'cancel' },
-      {
-        text: 'Delete',
-        style: 'destructive',
-        onPress: async () => {
-          try {
-            await getContainer().reviewApi.deleteReport(id);
-            await getContainer().service.discard(id); // drop a leftover local copy, if any
-            await qc.invalidateQueries({ queryKey: SERVER_REPORTS_KEY });
-          } catch {
-            Alert.alert('Could not delete', 'Check your connection and try again.');
-          }
-        },
-      },
-    ]);
-  }, [qc]);
-
   return (
     <ScreenTemplate
       title="Reports"
@@ -72,7 +50,6 @@ export function ReportsScreen() {
         onRefresh={() => void refetch()}
         onRetry={id => void getContainer().service.retry(id)}
         onDiscard={discard}
-        onDeleteServer={deleteServer}
         header={error ? <Banner tone="waiting" title="Can't reach the server" detail="Showing what is saved on this phone. Pull down to retry." /> : null}
       />
     </ScreenTemplate>

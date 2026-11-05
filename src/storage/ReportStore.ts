@@ -24,6 +24,6 @@ export interface ReportStore extends KeyValueStore {
   /** Remove local rows the server has confirmed in its list. */
   pruneSynced(serverIds: string[]): Promise<void>;
   deleteReport(id: string): Promise<void>;
-  /** Deletes reports + images. Keeps meta (sign-in token) on purpose. */
+  /** Deletes reports + images. Keeps meta (the silent device account's token) on purpose. */
   clearAll(): Promise<void>;
 }
